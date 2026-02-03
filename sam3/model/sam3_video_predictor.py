@@ -40,6 +40,13 @@ class Sam3VideoPredictor:
         self.video_loader_type = video_loader_type
         from sam3.model_builder import build_sam3_video_model
 
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        else:
+            self.device = "cpu"
+
         self.model = (
             build_sam3_video_model(
                 checkpoint_path=checkpoint_path,
@@ -48,8 +55,9 @@ class Sam3VideoPredictor:
                 geo_encoder_use_img_cross_attn=geo_encoder_use_img_cross_attn,
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
+                device=self.device,
             )
-            .cuda()
+            .to(self.device)
             .eval()
         )
 
@@ -278,8 +286,8 @@ class Sam3VideoPredictor:
     def _get_torch_and_gpu_properties(self):
         """Get a string for PyTorch and GPU properties (for logging and debugging)."""
         torch_and_gpu_str = (
-            f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list()}, "
-            f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device())}"
+            f"torch: {torch.__version__} with CUDA arch {torch.cuda.get_arch_list() if torch.cuda.is_available() else 'N/A'}, "
+            f"GPU device: {torch.cuda.get_device_properties(torch.cuda.current_device()) if torch.cuda.is_available() else 'N/A'}"
         )
         return torch_and_gpu_str
 
@@ -292,25 +300,41 @@ class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):
     def __init__(self, *model_args, gpus_to_use=None, **model_kwargs):
         if gpus_to_use is None:
             # if not specified, use only the current GPU by default
-            gpus_to_use = [torch.cuda.current_device()]
+            if torch.cuda.is_available():
+                gpus_to_use = [torch.cuda.current_device()]
+            else:
+                gpus_to_use = [0] # Dummy for CPU? MultiGPU logic might break on CPU.
 
         IS_MAIN_PROCESS = os.getenv("IS_MAIN_PROCESS", "1") == "1"
         if IS_MAIN_PROCESS:
-            gpus_to_use = sorted(set(gpus_to_use))
-            logger.info(f"using the following GPU IDs: {gpus_to_use}")
-            assert len(gpus_to_use) > 0 and all(isinstance(i, int) for i in gpus_to_use)
-            assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
-            os.environ["MASTER_ADDR"] = "localhost"
-            os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
-            os.environ["RANK"] = "0"
-            os.environ["WORLD_SIZE"] = f"{len(gpus_to_use)}"
+            if torch.cuda.is_available(): # Only setup DDP if CUDA
+                gpus_to_use = sorted(set(gpus_to_use))
+                logger.info(f"using the following GPU IDs: {gpus_to_use}")
+                assert len(gpus_to_use) > 0 and all(isinstance(i, int) for i in gpus_to_use)
+                assert all(0 <= i < torch.cuda.device_count() for i in gpus_to_use)
+                os.environ["MASTER_ADDR"] = "localhost"
+                os.environ["MASTER_PORT"] = f"{self._find_free_port()}"
+                os.environ["RANK"] = "0"
+                os.environ["WORLD_SIZE"] = f"{len(gpus_to_use)}"
 
         self.gpus_to_use = gpus_to_use
-        self.rank = int(os.environ["RANK"])
-        self.world_size = int(os.environ["WORLD_SIZE"])
+        
+        # Need to handle case where distributed is not set up (CPU or Single GPU fallback)
+        if "RANK" in os.environ:
+             self.rank = int(os.environ["RANK"])
+             self.world_size = int(os.environ["WORLD_SIZE"])
+        else:
+             self.rank = 0
+             self.world_size = 1
+
         self.rank_str = f"rank={self.rank} with world_size={self.world_size}"
-        self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
-        torch.cuda.set_device(self.device)
+        
+        if torch.cuda.is_available():
+            self.device = torch.device(f"cuda:{self.gpus_to_use[self.rank]}")
+            torch.cuda.set_device(self.device)
+        else:
+            self.device = torch.device("cpu") # or mps, managed by parent init
+        
         self.has_shutdown = False
         if self.rank == 0:
             logger.info("\n\n\n\t*** START loading model on all ranks ***\n\n")
