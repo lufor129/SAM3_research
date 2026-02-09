@@ -211,3 +211,170 @@ def draw_boxes_pil(image, boxes, scores=None, color="red", width=3):
                 draw.text(text_pos, text, fill=color)
             
     return img_copy
+
+
+@torch.inference_mode()
+def grounding_with_visual_prompt_and_attention(processor, image, visual_prompt_embed):
+    """
+    Performs grounding on Query Image and returns both detection results and attention info.
+    
+    Args:
+        processor: Sam3Processor instance
+        image: PIL Image, Query Image
+        visual_prompt_embed: Tensor, from extract_visual_prompt_embedding
+        
+    Returns:
+        state: Dict containing 'boxes', 'scores', etc.
+        attention_info: Dict containing encoder/decoder hidden states for visualization
+    """
+    attention_info = {}
+    
+    # Set image
+    state = processor.set_image(image)
+    
+    # Prepare dummy prompts
+    if "language_features" not in state["backbone_out"]:
+        dummy_text_outputs = processor.model.backbone.forward_text(["visual"], device=processor.device)
+        state["backbone_out"].update(dummy_text_outputs)
+        
+    if "geometric_prompt" not in state:
+        state["geometric_prompt"] = processor.model._get_dummy_prompt()
+        
+    # Get inputs
+    find_input = processor.find_stage
+    geometric_prompt = state["geometric_prompt"]
+    backbone_out = state["backbone_out"]
+    
+    # Create mask for visual prompt
+    visual_prompt_mask = torch.zeros(
+        (1, visual_prompt_embed.shape[0]), 
+        device=processor.device, 
+        dtype=torch.bool
+    )
+    
+    # 1. Encode Prompt (Inject Visual Prompt)
+    prompt, prompt_mask, backbone_out = processor.model._encode_prompt(
+        backbone_out, find_input, geometric_prompt,
+        visual_prompt_embed=visual_prompt_embed,
+        visual_prompt_mask=visual_prompt_mask
+    )
+    
+    # Save prompt info
+    attention_info['prompt'] = prompt.clone()
+    attention_info['prompt_mask'] = prompt_mask.clone()
+    
+    # 2. Run Encoder
+    backbone_out, encoder_out, _ = processor.model._run_encoder(
+        backbone_out, find_input, prompt, prompt_mask
+    )
+    
+    attention_info['encoder_hidden_states'] = encoder_out["encoder_hidden_states"].clone()
+    attention_info['spatial_shapes'] = encoder_out.get("spatial_shapes")
+    
+    out = {
+        "encoder_hidden_states": encoder_out["encoder_hidden_states"],
+        "prev_encoder_out": {
+            "encoder_out": encoder_out,
+            "backbone_out": backbone_out,
+        },
+    }
+    
+    # 3. Run Decoder
+    out, hs = processor.model._run_decoder(
+        memory=out["encoder_hidden_states"],
+        pos_embed=encoder_out["pos_embed"],
+        src_mask=encoder_out["padding_mask"],
+        out=out,
+        prompt=prompt,
+        prompt_mask=prompt_mask,
+        encoder_out=encoder_out,
+    )
+    
+    attention_info['decoder_hs'] = hs.clone()
+    
+    # 4. Post-process (Get boxes)
+    pred_logits = out["pred_logits"]
+    pred_boxes = out["pred_boxes"]
+    
+    prob = pred_logits.sigmoid()
+    scores, labels = prob.max(-1)
+    
+    # Un-normalize boxes
+    width, height = image.size
+    boxes_cxcywh = pred_boxes * torch.tensor([width, height, width, height], device=processor.device)
+    boxes_xyxy = box_cxcywh_to_xyxy(boxes_cxcywh)
+    
+    state["boxes"] = boxes_xyxy[0].detach().cpu().numpy()
+    state["scores"] = scores[0].detach().cpu().numpy()
+    
+    return state, attention_info
+
+
+def create_attention_overlay(attention_info, query_image):
+    """
+    Creates an attention heatmap overlay showing how the visual prompt attends to the query image.
+    
+    The attention is computed as the similarity between the visual prompt features
+    and the encoder features from the query image. This shows which regions of the
+    query image are most similar to the support image's bounding box region.
+    
+    Args:
+        attention_info: Dict from grounding_with_visual_prompt_and_attention
+        query_image: PIL Image, Query Image
+        
+    Returns:
+        overlay_image: PIL Image with attention heatmap overlay
+        attention_map: numpy array of the raw attention map
+    """
+    import torch.nn.functional as F
+    
+    # Get encoder output (this is specific to each query image)
+    encoder_hidden = attention_info['encoder_hidden_states']  # (HW, B, C)
+    # Get prompt (this is the visual prompt from support image)
+    prompt = attention_info['prompt']  # (N_prompt, B, C)
+    spatial_shapes = attention_info.get('spatial_shapes')
+    
+    # Take batch=0
+    prompt_feat = prompt[:, 0, :]  # (N_prompt, C)
+    encoder_feat = encoder_hidden[:, 0, :]  # (HW, C) - this is from query image
+    
+    # Compute cosine similarity between prompt and encoder features
+    prompt_feat_norm = F.normalize(prompt_feat.float(), dim=-1)
+    encoder_feat_norm = F.normalize(encoder_feat.float(), dim=-1)
+    
+    # Average prompt features then compute similarity
+    avg_prompt = prompt_feat_norm.mean(dim=0, keepdim=True)  # (1, C)
+    
+    # Compute similarity: how similar is each image position to the prompt?
+    similarity = torch.matmul(encoder_feat_norm, avg_prompt.T).squeeze(-1)  # (HW,)
+    
+    # Reshape to spatial dimensions
+    if spatial_shapes is not None:
+        H, W = spatial_shapes[0].tolist()
+    else:
+        HW = similarity.shape[0]
+        H = W = int(HW ** 0.5)
+    
+    attention_map = similarity.view(H, W).cpu().numpy()
+    
+    # Normalize to 0-1 range
+    attention_map = (attention_map - attention_map.min()) / (attention_map.max() - attention_map.min() + 1e-8)
+    
+    # Resize to image size
+    import matplotlib.cm as cm
+    
+    # Create heatmap using jet colormap
+    attention_resized = np.array(Image.fromarray(
+        (attention_map * 255).astype(np.uint8)
+    ).resize(query_image.size, Image.BILINEAR)) / 255.0
+    
+    # Apply colormap
+    heatmap = cm.jet(attention_resized)[:, :, :3]  # Remove alpha channel
+    heatmap = (heatmap * 255).astype(np.uint8)
+    heatmap_pil = Image.fromarray(heatmap)
+    
+    # Blend with original image
+    overlay = Image.blend(query_image.convert("RGB"), heatmap_pil, alpha=0.4)
+    
+    return overlay, attention_map
+
